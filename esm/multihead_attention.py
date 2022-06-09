@@ -14,6 +14,131 @@ from torch.nn import Parameter
 import uuid
 
 
+# generate orthogonal Gaussian random features
+def orthogonal_gaussian_random_feature(m, d):
+    def orthogonal_square():
+        # create orthogonal square matrix using Gram-Schmidt
+        q, _ = torch.qr(torch.randn(d, d))
+        return q.T
+
+    num_squares = int(m / d)
+    blocks = [orthogonal_square() for _ in range(num_squares)]
+
+    remainder = m - d * num_squares
+    if remainder:
+        blocks.append(orthogonal_square()[:remainder])
+
+    matrix = torch.cat(blocks)
+    matrix /= torch.sqrt(torch.tensor(num_squares + remainder / d))
+
+    return matrix
+
+
+def softmax_kernel_transformation(
+    data,
+    is_query,
+    projection_matrix=None,
+    numerical_stabilizer=1e-6,
+):
+    """
+    Random feature calculation for softmax kernel using FAVOR+ mechanism
+     :param data: the input tensor. [L, B, H, D] B-batch dimension, L-attention dimensions, H-Heads, D-features
+     :param is_query: A value indicating whether the input value is a query or a key.
+     :param projection_matrix: Random Gaussian matrix with shape [M, D]
+                  M - M means the number of random features,
+                  Each [D, D] subblock has pairwise orthogonal rows.
+     :param numerical_stabilizer: small positive constant for numerical stability
+     :return:
+    """
+    data_normalizer = data.shape[-1] ** -0.25
+    data = data_normalizer * data
+    ratio = projection_matrix.shape[0] ** -0.5
+    data_dash = torch.einsum("lbhd,md->lbhm", data, projection_matrix)
+
+    diag_data = torch.square(data)
+    diag_data = torch.sum(diag_data, dim=-1)
+    diag_data = diag_data / 2.0
+    diag_data = diag_data.unsqueeze(dim=-1)
+
+    if is_query:
+        data_dash = ratio * (
+            torch.exp(data_dash - diag_data - torch.max(data_dash, dim=-1, keepdims=True).values) + numerical_stabilizer)
+    else:
+        data_dash = ratio * (
+            torch.exp(data_dash - diag_data - torch.max(data_dash)) + numerical_stabilizer)
+
+    return data_dash
+
+
+def noncausal_numerator(qs, ks, vs):
+    """Computes not-normalized FAVOR noncausal attention AV.
+    Args:
+      qs: query_prime tensor of the shape [L,B,H,M].
+      ks: key_prime tensor of the shape [S,B,H,M].
+      vs: value tensor of the shape [S,B,H,D].
+    Returns:
+      Not-normalized FAVOR noncausal attention AV.
+    """
+    kvs = torch.einsum("lbhm,lbhd->bhmd", ks, vs)
+    return torch.einsum("lbhm,bhmd->lbhd", qs, kvs)
+
+
+def noncausal_denominator(qs, ks):
+    """Computes FAVOR normalizer in noncausal attention.
+    Args:
+      qs: query_prime tensor of the shape [S,B,H,M].
+      ks: key_prime tensor of the shape [S,B,H,M].
+    Returns:
+      FAVOR normalizer in noncausal attention.
+    """
+    all_ones = torch.ones([ks.shape[0]]).to(qs)
+    ks_sum = torch.einsum("lbhm,l->bhm", ks, all_ones)
+    return torch.einsum("lbhm,bhm->lbh", qs, ks_sum)
+
+
+def favor_attention(
+    query,
+    key,
+    value,
+    kernel_transformation=softmax_kernel_transformation,
+    causal=False,
+    projection_matrix=None,
+    key_padding_mask: Optional[Tensor] = None
+):
+    """
+    Calculate favor_attention
+
+    Args:
+        query: query [L, B, H, D]
+        key: key [S, B, H, D]
+        value: value  [S, B, H, D]
+        kernel_transformation: Transformation to get kernel features.
+            Use relu_kernel_transformation or softmax_kernel_transformation.
+        causal: causal or not
+        projection_matrix: the [M, D] projection matrix to be used
+        key_padding_mask: [B, S] mask for source sequence padding. Used on value
+            since we do not return full attn matrix.
+
+    Returns:
+        Favor+ normalized attention with shape [L, B, H, D]
+    """
+    # Kernel Transformation
+    query_prime = kernel_transformation(
+        query, True, projection_matrix)  # [L, B, H, M]
+    key_prime = kernel_transformation(
+        key, False, projection_matrix)  # [S, B, H, M]
+    if key_padding_mask is not None:
+        value = value * key_padding_mask.T[..., None, None]  # [S, B, H, D]
+
+    # Causal or Not
+    assert causal is False
+    av_attn = noncausal_numerator(query_prime, key_prime, value)  # [L, B, H, D]
+    attn_normalizer = noncausal_denominator(
+        query_prime, key_prime)  # [L, B, H]
+
+    return av_attn / attn_normalizer.unsqueeze(-1)
+
+
 def utils_softmax(x, dim: int, onnx_trace: bool = False):
     if onnx_trace:
         return F.softmax(x.float(), dim=dim)
@@ -82,6 +207,7 @@ class MultiheadAttention(nn.Module):
         add_zero_attn=False,
         self_attention=False,
         encoder_decoder_attention=False,
+        n_random_features=0,  # if > 0, will use performer FAVOR+ attention
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -120,13 +246,17 @@ class MultiheadAttention(nn.Module):
 
         self.reset_parameters()
 
+        self.n_random_features = n_random_features
+        if n_random_features > 0:
+            random_features = orthogonal_gaussian_random_feature(
+                n_random_features, self.head_dim)
+            self.register_buffer('projection_matrix', random_features)
+
         self.onnx_trace = False
 
         self.enable_torch_version = False
         if hasattr(F, "multi_head_attention_forward"):
             self.enable_torch_version = True
-        else:
-            self.enable_torch_version = False
 
     def prepare_for_onnx_export_(self):
         self.onnx_trace = True
@@ -153,7 +283,7 @@ class MultiheadAttention(nn.Module):
 
     def forward(
         self,
-        query,
+        query: Tensor,
         key: Optional[Tensor],
         value: Optional[Tensor],
         key_padding_mask: Optional[Tensor] = None,
@@ -181,6 +311,19 @@ class MultiheadAttention(nn.Module):
                 weights for each head. Implies *need_weights*. Default:
                 return the average attention weights over all heads.
         """
+        """
+        ```
+            x, attn = self.self_attn(
+                query=x,
+                key=x,
+                value=x,
+                key_padding_mask=self_attn_padding_mask,
+                need_weights=True,
+                need_head_weights=need_head_weights,
+                attn_mask=self_attn_mask,
+            )
+        ```
+        """
         if need_head_weights:
             need_weights = True
 
@@ -189,7 +332,8 @@ class MultiheadAttention(nn.Module):
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
 
         if (
-            self.enable_torch_version
+            self.n_random_features == 0
+            and self.enable_torch_version
             and not self.onnx_trace
             and incremental_state is None
             and not static_kv
@@ -200,9 +344,9 @@ class MultiheadAttention(nn.Module):
         ):
             assert key is not None and value is not None
             return F.multi_head_attention_forward(
-                query,
-                key,
-                value,
+                query,  # [L, B, d]
+                key,  # [S, B, d]
+                value,  # [S, B, d]
                 self.embed_dim,
                 self.num_heads,
                 torch.empty([0]),
@@ -253,12 +397,13 @@ class MultiheadAttention(nn.Module):
             q = self.q_proj(query)
             k = self.k_proj(key)
             v = self.v_proj(value)
-        q *= self.scaling
+        if self.n_random_features == 0:
+            q *= self.scaling
 
         if self.bias_k is not None:
             assert self.bias_v is not None
-            k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])
-            v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])
+            k = torch.cat([k, self.bias_k.repeat(1, bsz, 1)])  # [S+1, B, d]
+            v = torch.cat([v, self.bias_v.repeat(1, bsz, 1)])  # [S+1, B, d]
             if attn_mask is not None:
                 attn_mask = torch.cat(
                     [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
@@ -270,13 +415,20 @@ class MultiheadAttention(nn.Module):
                         key_padding_mask.new_zeros(key_padding_mask.size(0), 1),
                     ],
                     dim=1,
-                )
+                )  # [B, S+1]
 
-        q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
-        if k is not None:
-            k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
-        if v is not None:
-            v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        if self.n_random_features == 0:
+            q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            if k is not None:
+                k = k.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+            if v is not None:
+                v = v.contiguous().view(-1, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        else:
+            q = q.view(q.size(0), q.size(1), self.num_heads, self.head_dim).contiguous()
+            if k is not None:
+                k = k.view(k.size(0), k.size(1), self.num_heads, self.head_dim).contiguous()
+            if v is not None:
+                v = v.view(v.size(0), v.size(1), self.num_heads, self.head_dim).contiguous()
 
         if saved_state is not None:
             # saved states are stored with shape (bsz, num_heads, seq_len, head_dim)
@@ -317,7 +469,10 @@ class MultiheadAttention(nn.Module):
             assert incremental_state is not None
             incremental_state = self._set_input_buffer(incremental_state, saved_state)
         assert k is not None
-        src_len = k.size(1)
+        if self.n_random_features == 0:
+            src_len = k.size(1)
+        else:
+            src_len = k.size(0)
 
         # This is part of a workaround to get around fork/join parallelism
         # not supporting Optional types.
@@ -346,44 +501,56 @@ class MultiheadAttention(nn.Module):
                     dim=1,
                 )
 
-        attn_weights = torch.bmm(q, k.transpose(1, 2))
-        attn_weights = MultiheadAttention.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
-
-        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
-
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(0)
-            if self.onnx_trace:
-                attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
-            attn_weights += attn_mask
-
-        if key_padding_mask is not None:
-            # don't attend to padding symbols
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf")
-            )
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
-
-        if before_softmax:
-            return attn_weights, v
-
-        attn_weights_float = utils_softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
-        attn_weights = attn_weights_float.type_as(attn_weights)
-        attn_probs = F.dropout(
-            attn_weights_float.type_as(attn_weights),
-            p=self.dropout,
-            training=self.training,
-        )
-        assert v is not None
-        attn = torch.bmm(attn_probs, v)
-        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
-        if self.onnx_trace and attn.size(1) == 1:
-            # when ONNX tracing a single decoder step (sequence length == 1)
-            # the transpose is a no-op copy before view, thus unnecessary
-            attn = attn.contiguous().view(tgt_len, bsz, embed_dim)
+        if self.n_random_features:
+            attn = favor_attention(
+                q,
+                k,
+                v,
+                projection_matrix=self.projection_matrix,
+                key_padding_mask=key_padding_mask,
+            )  # [L, B, H, D]
+            attn = attn.flatten(-2)  # [L, B, H * D]
+            need_weights = False
         else:
-            attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+            attn_weights = torch.bmm(q, k.transpose(1, 2))
+            attn_weights = MultiheadAttention.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
+
+            assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
+
+            if attn_mask is not None:
+                attn_mask = attn_mask.unsqueeze(0)
+                if self.onnx_trace:
+                    attn_mask = attn_mask.repeat(attn_weights.size(0), 1, 1)
+                attn_weights += attn_mask
+
+            if key_padding_mask is not None:
+                # don't attend to padding symbols
+                attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                attn_weights = attn_weights.masked_fill(
+                    key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool), float("-inf")
+                )
+                attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+
+            if before_softmax:
+                return attn_weights, v
+
+            attn_weights_float = utils_softmax(attn_weights, dim=-1, onnx_trace=self.onnx_trace)
+            attn_weights = attn_weights_float.type_as(attn_weights)
+            attn_probs = F.dropout(
+                attn_weights,
+                p=self.dropout,
+                training=self.training,
+            )
+            assert v is not None
+            attn = torch.bmm(attn_probs, v)
+            assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
+            if self.onnx_trace and attn.size(1) == 1:
+                # when ONNX tracing a single decoder step (sequence length == 1)
+                # the transpose is a no-op copy before view, thus unnecessary
+                attn = attn.contiguous().view(tgt_len, bsz, embed_dim)
+            else:
+                attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+                
         attn = self.out_proj(attn)
         attn_weights: Optional[Tensor] = None
         if need_weights:
