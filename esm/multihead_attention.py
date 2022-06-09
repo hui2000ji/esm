@@ -207,7 +207,7 @@ class MultiheadAttention(nn.Module):
         add_zero_attn=False,
         self_attention=False,
         encoder_decoder_attention=False,
-        n_random_features=0,  # if > 0, will use performer FAVOR+ attention
+        n_random_features=128,  # if > 0 (default), will use performer FAVOR+ attention
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -310,19 +310,6 @@ class MultiheadAttention(nn.Module):
             need_head_weights (bool, optional): return the attention
                 weights for each head. Implies *need_weights*. Default:
                 return the average attention weights over all heads.
-        """
-        """
-        ```
-            x, attn = self.self_attn(
-                query=x,
-                key=x,
-                value=x,
-                key_padding_mask=self_attn_padding_mask,
-                need_weights=True,
-                need_head_weights=need_head_weights,
-                attn_mask=self_attn_mask,
-            )
-        ```
         """
         if need_head_weights:
             need_weights = True
